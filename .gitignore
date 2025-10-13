@@ -1,0 +1,8 @@
+examples
+
+outputs/*
+!outputs/Potato___Early_blight_health_analysis.png
+
+.vscode
+
+__pycache__
