@@ -2,9 +2,10 @@ import os
 from pprint import pprint
 from analyzer import DINOv3PlantHealthAnalyzer
 
+
 if __name__ == "__main__":
-    token = os.environ.get("H_HUB_TOKEN")
-    analyzer = DINOv3PlantHealthAnalyzer(model_size="base", token=token)
+    token = os.environ.get("HF_HUB_TOKEN")
+    analyzer = DINOv3PlantHealthAnalyzer(token=token, mode="local")
 
     # Analyze single leaf
     result = analyzer.analyze_leaf_health("examples/Potato___Early_blight.png")

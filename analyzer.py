@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import sys
 import torch
 import numpy as np
 from PIL import Image
@@ -12,38 +14,51 @@ from transformers import AutoImageProcessor, AutoModel
 
 from utils import visualize_dinov3_dense_features, compare_feature_quality
 
+DINOV3_REPO = "/home/mmhamdi/workspace/vlms/vege/dinov3"
+sys.path.insert(0, DINOV3_REPO)
+
+# from dinov3.eval.segmentation.models import (
+#     build_segmentation_decoder,
+#     BackboneLayersSet,
+# )
+from dinov3.eval.segmentation.inference import make_inference
+
+
 warnings.filterwarnings("ignore")
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 class DINOv3PlantHealthAnalyzer:
-    def __init__(self, model_size="large", token=None):
+    def __init__(self, token=None, mode="local", backbone_size=None):
         """
-        Initialize DINOv3 model for plant health analysis using Transformers
-        model_size: 'small', 'base', 'large', or 'giant'
+        Initialize DINOv3 backbone for plant health analysis using Transformers
+        backbone_size: 'small', 'base', 'large', or 'giant'
         """
-        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if mode != "local" and backbone_size is not None:
+            # backbone name mapping for DINOv3 from Transformers
+            backbone_names = {
+                "small": "facebook/dinov3-vits16-pretrain-lvd1689m",
+                "base": "facebook/dinov3-vit7b16-pretrain-lvd1689m",
+                "large": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+                "giant": "facebook/dinov3-vith16plus-pretrain-lvd1689m",
+            }
+            backbone_name = backbone_names.get(
+                backbone_size, "facebook/dinov3-vitb16-pretrain-lvd1689m"
+            )
+            # Load DINOv3 backbone and processor from Transformers
+            print(f"Loading {backbone_name} backbone from Transformers...")
+            self.processor = AutoImageProcessor.from_pretrained(
+                backbone_name, token=token
+            )
+            self.backbone = AutoModel.from_pretrained(backbone_name, token=token)
+            self.backbone.to(self.device)
+            self.backbone.eval()
+            print(f"Loaded DINOv3 ViT-{backbone_size.upper()} backbone successfully")
 
-        # Model name mapping for DINOv3 from Transformers
-        model_names = {
-            "small": "facebook/dinov3-vits16-pretrain-lvd1689m",
-            "base": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-            "large": "facebook/dinov3-vitl16-pretrain-lvd1689m",
-            "high": "facebook/dinov3-vith16plus-pretrain-lvd1689m",
-        }
-
-        model_name = model_names.get(
-            model_size, "facebook/dinov3-vitb16-pretrain-lvd1689m"
-        )
-
-        # Load DINOv3 model and processor from Transformers
-        print(f"Loading {model_name} model from Transformers...")
-        self.processor = AutoImageProcessor.from_pretrained(model_name, token=token)
-        self.model = AutoModel.from_pretrained(model_name, token=token)
-
-        self.model.to(self.device)
-        self.model.eval()
-
-        print(f"Loaded DINOv3 ViT-{model_size.upper()} model successfully")
+        else:
+            self._build_segmentation_model()
 
         # Define health indicators based on feature patterns
         self.health_indicators = {
@@ -52,9 +67,35 @@ class DINOv3PlantHealthAnalyzer:
             "diseased": {"color_range": (0.7, 1.0), "texture_uniformity": 0.4},
         }
 
-        # Initialize calibration data storage
-        self.calibration_data = None
-        self.health_model = None
+    def _build_segmentation_model(self):
+        BACKBONE_WEIGHTS = "/home/mmhamdi/workspace/vlms/vege/dinov3_weights/segmentation/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+        SEGMENTOR_WEIGHTS = "/home/mmhamdi/workspace/vlms/vege/dinov3_weights/segmentation/dinov3_vit7b16_ade20k_m2f_head-bf307cb1.pth"
+        # Load segmentor with backbone and head weights
+        self.segmentor = torch.hub.load(
+            DINOV3_REPO,
+            "dinov3_vit7b16_ms",
+            source="local",
+            weights=SEGMENTOR_WEIGHTS,
+            backbone_weights=BACKBONE_WEIGHTS,
+        )
+
+        # """Attach called DinoV3 backbone from HF with its segmentation head"""
+        # checkpoint = torch.load(self.SEGMENTOR_HEAD_WEIGHTS, map_location="cpu")
+        # self.segmentation_model = build_segmentation_decoder(
+        #     backbone_model=self.backbone,
+        #     backbone_out_layers=BackboneLayersSet.FOUR_EVEN_INTERVALS,
+        #     decoder_type="m2f",
+        #     hidden_dim=2048,
+        #     num_classes=150,  # ADE20K
+        #     autocast_dtype=(
+        #         torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        #     ),
+        # )
+        # # Load the weights (the checkpoint contains the full model)
+        # self.segmentation_model.load_state_dict(checkpoint, strict=False)
+        self.segmetor = self.segmentor.to(self.device)
+        # self.segmentation_model.eval()
+        print(f"Loaded segmentation model.")
 
     def extract_leaf_features(self, image_path):
         """Extract dense features from leaf image using Transformers"""
@@ -65,11 +106,16 @@ class DINOv3PlantHealthAnalyzer:
         # Preprocess image using the processor
         inputs = self.processor(images=image, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        num_register_tokens = self.model.config.num_register_tokens
+        num_register_tokens = self.backbone.config.num_register_tokens
+
+        segmentation_map = self.segmentation_model.predict(
+            inputs["pixel_values"],
+            rescale_to=(original_size[0], original_size[1]),
+        )
 
         with torch.no_grad():
-            # Get model outputs
-            outputs = self.model(**inputs, output_hidden_states=True)
+            # Get backbone outputs
+            outputs = self.backbone(**inputs, output_hidden_states=True)
 
             # Extract features from multiple layers
             hidden_states = outputs.hidden_states
@@ -124,7 +170,7 @@ class DINOv3PlantHealthAnalyzer:
         feature_variance = np.var(features, axis=1)
 
         # Perform clustering to identify different leaf regions
-        n_clusters = 3  # Background, healthy, diseased
+        n_clusters = 2  # healthy, diseased
         kmeans = KMeans(n_clusters=n_clusters, random_state=42)
         cluster_labels = kmeans.fit_predict(features)
 
@@ -148,22 +194,15 @@ class DINOv3PlantHealthAnalyzer:
 
         # Map clusters to health categories
         health_map = np.zeros_like(cluster_map)
-        if len(sorted_clusters) >= 2:
-            # Assuming first cluster is background
-            background_id = sorted_clusters[0][0]
-            health_map[cluster_map == background_id] = 0  # Background
-
+        if len(sorted_clusters) == 2:
+            # # Assuming first cluster is background
+            # background_id = sorted_clusters[0][0]
+            # health_map[cluster_map == background_id] = 0  # Background
             # Map remaining clusters to health states
-            if len(sorted_clusters) >= 3:
-                healthy_id = sorted_clusters[1][0]
-                health_map[cluster_map == healthy_id] = 1  # Healthy
-
-                if len(sorted_clusters) >= 3:
-                    diseased_id = sorted_clusters[2][0]
-                    health_map[cluster_map == diseased_id] = 2  # Diseased
-                else:
-                    diseased_id = sorted_clusters[2][0]
-                    health_map[cluster_map == diseased_id] = 3  # Diseased
+            healthy_id = sorted_clusters[0][0]
+            health_map[cluster_map == healthy_id] = 0  # Healthy
+            diseased_id = sorted_clusters[1][0]
+            health_map[cluster_map == diseased_id] = 1  # Diseased
 
         return (
             health_map,
@@ -367,7 +406,7 @@ class DINOv3PlantHealthAnalyzer:
         from matplotlib.patches import Patch
 
         legend_elements = [
-            Patch(facecolor="black", label="Background"),
+            # Patch(facecolor="black", label="Background"),
             Patch(facecolor="green", label="Healthy"),
             # Patch(facecolor="yellow", label="Stressed"),
             Patch(facecolor="red", label="Diseased"),
