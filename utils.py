@@ -2,6 +2,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
+import torch
+from torchvision.transforms import v2
+import matplotlib.pyplot as plt
+
+
+def make_transform(resize_size: int | list[int] = 896):
+    to_tensor = v2.ToImage()
+    resize = v2.Resize((resize_size, resize_size), antialias=True)
+    to_float = v2.ToDtype(torch.float32, scale=True)
+    normalize = v2.Normalize(
+        mean=(0.485, 0.456, 0.406),
+        std=(0.229, 0.224, 0.225),
+    )
+    return v2.Compose([to_tensor, resize, to_float, normalize])
 
 
 def visualize_dinov3_dense_features(

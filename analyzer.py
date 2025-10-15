@@ -1,3 +1,4 @@
+from functools import partial
 from pathlib import Path
 import os
 import sys
@@ -12,7 +13,11 @@ from datetime import datetime
 import warnings
 from transformers import AutoImageProcessor, AutoModel
 
-from utils import visualize_dinov3_dense_features, compare_feature_quality
+from utils import (
+    make_transform,
+    visualize_dinov3_dense_features,
+    compare_feature_quality,
+)
 
 DINOV3_REPO = "/home/mmhamdi/workspace/vlms/vege/dinov3"
 sys.path.insert(0, DINOV3_REPO)
@@ -101,21 +106,35 @@ class DINOv3PlantHealthAnalyzer:
         """Extract dense features from leaf image using Transformers"""
         # Load image
         image = Image.open(image_path).convert("RGB")
+        img_size = 896
         original_size = image.size
+        transform = make_transform(img_size)
         self.img_name = Path(image_path).stem
         # Preprocess image using the processor
-        inputs = self.processor(images=image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        num_register_tokens = self.backbone.config.num_register_tokens
+        # inputs = self.processor(images=image, return_tensors="pt")
+        # inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # num_register_tokens = self.segmentor.backbone.config.num_register_tokens
 
-        segmentation_map = self.segmentation_model.predict(
-            inputs["pixel_values"],
-            rescale_to=(original_size[0], original_size[1]),
-        )
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                image = transform(image)[None]
+                image = torch.tensor(image, dtype=torch.float16).to(self.device)
+                raw_preds = self.segmentor(image)
+                segmentation_map = make_inference(
+                    image,
+                    self.segmentor,
+                    inference_mode="slide",
+                    decoder_head_type="m2f",
+                    rescale_to=(original_size[-1], original_size[-2]),
+                    n_output_channels=150,
+                    crop_size=(img_size, img_size),
+                    stride=(img_size, img_size),
+                    output_activation=partial(torch.nn.functional.softmax, dim=1),
+                ).argmax(dim=1, keepdim=True)
 
         with torch.no_grad():
             # Get backbone outputs
-            outputs = self.backbone(**inputs, output_hidden_states=True)
+            outputs = self.segmentor.backbone(image, output_hidden_states=True)
 
             # Extract features from multiple layers
             hidden_states = outputs.hidden_states
